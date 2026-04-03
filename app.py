@@ -90,7 +90,7 @@ st.markdown("""
 # ═══════════════════════════════════════════════════════════════
 # DATA LOADING (cached)
 # ═══════════════════════════════════════════════════════════════
-@st.cache_data(ttl=3600, show_spinner="Downloading GPR data...")
+@st.cache_data(ttl=86400, show_spinner="Downloading GPR data...")
 def load_gpr():
     try:
         gpr = pd.read_excel('https://www.matteoiacoviello.com/gpr_files/data_gpr_daily_recent.xls')
@@ -374,16 +374,6 @@ def main():
             st.caption(f"Auto-refreshes every 60s")
         else:
             st.info("No geopolitical contracts found")
-        
-        st.divider()
-        st.markdown("### 📊 CBOE Thesis")
-        st.markdown(f"""
-        - **Price:** $273 → Target $317 (+16%)
-        - **Fwd P/E:** 22.1x (5yr avg: 30.8x)
-        - **Revenue:** $2.4B (+17% YoY)
-        - **0DTE:** 59% of SPX volume
-        - **Thesis:** SENTINEL elevated → VIX volume up → CBOE earns more
-        """)
         
         st.divider()
         if st.button("🔄 Refresh All Data"):
