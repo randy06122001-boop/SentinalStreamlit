@@ -237,8 +237,14 @@ def main():
     
     df = build_merged_dataset(gpr, vix, vix3m, spy, ovx)
     df = engineer_features(df)
-    
-    latest = df.dropna(subset=['SENTINEL_SCORE']).iloc[-1]
+
+    valid_df = df.dropna(subset=['SENTINEL_SCORE'])
+    if valid_df.empty:
+        st.error("⚠️ No valid SENTINEL_SCORE data could be computed. "
+                 "This usually means market data (VIX/SPX) failed to load. "
+                 "Try clicking 'Refresh All Data' in the sidebar.")
+        st.stop()
+    latest = valid_df.iloc[-1]
     latest_date = latest.name.strftime('%Y-%m-%d')
     
     # Polymarket average
