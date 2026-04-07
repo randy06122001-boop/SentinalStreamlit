@@ -12,10 +12,50 @@ from plotly.subplots import make_subplots
 import yfinance as yf
 import requests
 import json
+import time
 from datetime import datetime, timedelta
 from scipy import stats
 import warnings
 warnings.filterwarnings('ignore')
+
+
+# ═══════════════════════════════════════════════════════════════
+# RETRY + FALLBACK HELPERS
+# ═══════════════════════════════════════════════════════════════
+
+def _yf_download_with_retry(ticker, start, retries=3, backoff=2):
+    """Download from Yahoo Finance with retry + exponential backoff."""
+    last_err = None
+    for attempt in range(retries):
+        try:
+            data = yf.download(ticker, start=start, progress=False)
+            if data is not None and not data.empty:
+                if isinstance(data.columns, pd.MultiIndex):
+                    data.columns = data.columns.get_level_values(0)
+                return data
+        except Exception as e:
+            last_err = e
+        if attempt < retries - 1:
+            time.sleep(backoff ** attempt)  # 1s, 2s between retries
+    return pd.DataFrame()
+
+
+def _fred_series(series_id, start='1985-01-01'):
+    """Fetch a FRED time-series via the public CSV endpoint (no API key required)."""
+    try:
+        url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}&cosd={start}"
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
+        from io import StringIO
+        df = pd.read_csv(StringIO(resp.text), parse_dates=['observation_date'],
+                         index_col='observation_date', na_values=['.'])
+        df = df.dropna().sort_index()
+        df.columns = ['value']
+        df['value'] = df['value'].astype(float)
+        df.index.name = 'date'
+        return df
+    except Exception:
+        return pd.DataFrame()
 
 # ═══════════════════════════════════════════════════════════════
 # PAGE CONFIG
@@ -106,25 +146,44 @@ def load_gpr():
 
 @st.cache_data(ttl=3600, show_spinner="Downloading market data...")
 def load_market_data():
-    vix = yf.download('^VIX', start='1990-01-01', progress=False)
-    if isinstance(vix.columns, pd.MultiIndex): vix.columns = vix.columns.get_level_values(0)
-    vix = vix[['Close']].rename(columns={'Close': 'VIX'})
-    
-    vix3m = yf.download('^VIX3M', start='2007-01-01', progress=False)
-    if isinstance(vix3m.columns, pd.MultiIndex): vix3m.columns = vix3m.columns.get_level_values(0)
-    vix3m = vix3m[['Close']].rename(columns={'Close': 'VIX3M'})
-    
-    spy = yf.download('^GSPC', start='1985-01-01', progress=False)
-    if isinstance(spy.columns, pd.MultiIndex): spy.columns = spy.columns.get_level_values(0)
-    spy = spy[['Close']].rename(columns={'Close': 'SPX'})
-    
-    try:
-        ovx = yf.download('^OVX', start='2007-01-01', progress=False)
-        if isinstance(ovx.columns, pd.MultiIndex): ovx.columns = ovx.columns.get_level_values(0)
-        ovx = ovx[['Close']].rename(columns={'Close': 'OVX'})
-    except:
+    # --- VIX (with FRED fallback: VIXCLS) ---
+    vix_raw = _yf_download_with_retry('^VIX', '1990-01-01')
+    if vix_raw.empty:
+        st.info("Yahoo VIX unavailable — falling back to FRED (VIXCLS).")
+        fred_vix = _fred_series('VIXCLS', '1990-01-01')
+        if not fred_vix.empty:
+            vix = fred_vix.rename(columns={'value': 'VIX'})
+        else:
+            vix = pd.DataFrame()
+    else:
+        vix = vix_raw[['Close']].rename(columns={'Close': 'VIX'})
+
+    # --- VIX3M (no public FRED equivalent — best effort only) ---
+    vix3m_raw = _yf_download_with_retry('^VIX3M', '2007-01-01')
+    if vix3m_raw.empty:
+        vix3m = pd.DataFrame()
+    else:
+        vix3m = vix3m_raw[['Close']].rename(columns={'Close': 'VIX3M'})
+
+    # --- SPX (with FRED fallback: SP500) ---
+    spy_raw = _yf_download_with_retry('^GSPC', '1985-01-01')
+    if spy_raw.empty:
+        st.info("Yahoo S&P 500 unavailable — falling back to FRED (SP500).")
+        fred_sp = _fred_series('SP500', '1985-01-01')
+        if not fred_sp.empty:
+            spy = fred_sp.rename(columns={'value': 'SPX'})
+        else:
+            spy = pd.DataFrame()
+    else:
+        spy = spy_raw[['Close']].rename(columns={'Close': 'SPX'})
+
+    # --- OVX (optional — no fallback needed) ---
+    ovx_raw = _yf_download_with_retry('^OVX', '2007-01-01')
+    if ovx_raw.empty:
         ovx = pd.DataFrame()
-    
+    else:
+        ovx = ovx_raw[['Close']].rename(columns={'Close': 'OVX'})
+
     return vix, vix3m, spy, ovx
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -157,10 +216,21 @@ def load_polymarket():
 
 
 def build_merged_dataset(gpr, vix, vix3m, spy, ovx):
-    merged = spy.join(vix, how='left').join(vix3m, how='left')
+    # Guard: SPX is mandatory for every downstream calculation
+    if spy is None or spy.empty:
+        st.error("S&P 500 data is completely unavailable (Yahoo + FRED). Cannot compute SENTINEL score.")
+        st.stop()
+    # Guard: VIX is mandatory (30 % weight)
+    if vix is None or vix.empty:
+        st.error("VIX data is completely unavailable (Yahoo + FRED). Cannot compute SENTINEL score.")
+        st.stop()
+
+    merged = spy.join(vix, how='left')
+    if vix3m is not None and not vix3m.empty:
+        merged = merged.join(vix3m, how='left')
     if ovx is not None and not ovx.empty:
         merged = merged.join(ovx, how='left')
-    if gpr is not None:
+    if gpr is not None and not gpr.empty:
         gpr_bdays = gpr.resample('B').last().ffill()
         merged = merged.join(gpr_bdays, how='left')
     merged = merged.dropna(subset=['SPX', 'VIX'])
@@ -175,9 +245,12 @@ def engineer_features(df):
         df['GPR_THREAT_ZSCORE'] = (df['GPRD_THREAT'] - df['GPRD_THREAT'].rolling(252).mean()) / df['GPRD_THREAT'].rolling(252).std()
         df['GPR_THREAT_ACT_RATIO'] = df['GPRD_THREAT'] / df['GPRD_ACT'].replace(0, np.nan)
     
-    df['VIX_RATIO'] = df['VIX'] / df['VIX3M']
+    if 'VIX3M' in df.columns:
+        df['VIX_RATIO'] = df['VIX'] / df['VIX3M']
+    else:
+        df['VIX_RATIO'] = np.nan
     df['VIX_ZSCORE'] = (df['VIX'] - df['VIX'].rolling(252).mean()) / df['VIX'].rolling(252).std()
-    df['BACKWARDATION'] = (df['VIX_RATIO'] > 1.0).astype(int)
+    df['BACKWARDATION'] = (df['VIX_RATIO'] > 1.0).astype(int) if 'VIX_RATIO' in df.columns else 0
     
     def norm(s, lo, hi):
         return ((s - lo) / (hi - lo)).clip(0, 1) * 100
@@ -325,6 +398,7 @@ def main():
     with c2:
         vix_val = latest['VIX']
         vix_ratio = latest.get('VIX_RATIO', 0)
+        if pd.isna(vix_ratio): vix_ratio = 0
         vc = 'red' if vix_val > 30 else 'amber' if vix_val > 20 else 'green'
         struct = "BACKWARDATION" if vix_ratio > 1 else "CONTANGO"
         struct_badge = 'badge-red' if vix_ratio > 1 else 'badge-green'
@@ -444,7 +518,7 @@ def main():
     with col_ratio:
         st.markdown('<div class="section-header">VIX/VIX3M RATIO — BACKWARDATION HISTORY</div>', unsafe_allow_html=True)
         
-        vix_ratio_data = df[['VIX_RATIO']].dropna()
+        vix_ratio_data = df[['VIX_RATIO']].dropna() if 'VIX_RATIO' in df.columns else pd.DataFrame()
         if len(vix_ratio_data) > 0:
             fig_ratio = go.Figure()
             fig_ratio.add_trace(go.Scatter(x=vix_ratio_data.index, y=vix_ratio_data['VIX_RATIO'],
@@ -463,7 +537,9 @@ def main():
             
             fig_ratio.update_layout(**DARK_LAYOUT, height=300, yaxis_title="Ratio")
             st.plotly_chart(fig_ratio, use_container_width=True)
-    
+        else:
+            st.info("VIX3M data unavailable — term-structure chart skipped.")
+
     # ════════════════════════════════════════════
     # BACKTEST RESULTS
     # ════════════════════════════════════════════
